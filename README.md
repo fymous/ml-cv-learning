@@ -19,6 +19,8 @@ Default inference rate is **1 FPS**. That is enough for crossing counts and zone
 
 ## Quick start
 
+Full walkthrough (Windows, flags, errors): **[LOCAL.md](LOCAL.md)**.
+
 ```bash
 git clone https://github.com/fymous/ml-cv-learning.git
 cd ml-cv-learning/worker
@@ -43,6 +45,8 @@ python -m app.main --source 0
 
 First run downloads `yolov8n.pt`. InsightFace downloads `buffalo_s` only if `FEATURE_DEMOGRAPHICS=true`.
 
+No Podman or Docker — this repo is venv + a video file only.
+
 ## Feature flags
 
 Each capability is independent. Flip them in `.env`:
@@ -57,6 +61,7 @@ FEATURE_POSE=false
 
 ## Docs
 
+- [LOCAL.md](LOCAL.md) — how to run on a laptop (no containers)
 - [FEATURES.md](FEATURES.md) — what to build, in order
 - [STRUCTURE.md](STRUCTURE.md) — folders, loop, YOLO, ByteTrack, pose, zones
 - [FEATURE_CONTRACT.md](FEATURE_CONTRACT.md) — how to add a capability so it can be copied elsewhere later
