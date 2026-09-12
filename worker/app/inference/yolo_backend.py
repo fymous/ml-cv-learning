@@ -12,6 +12,7 @@ class YoloBackend(InferenceBackend):
 
         settings = get_settings()
         self._conf = conf if conf is not None else settings.yolo_conf_threshold
+        self._tracker = settings.tracker
         self._model = YOLO(model_path or settings.yolo_model)
         self._names: dict[int, str] = self._model.names  # type: ignore[assignment]
 
@@ -20,13 +21,19 @@ class YoloBackend(InferenceBackend):
         return self._parse_results(results, tracked=False)
 
     def detect_tracked(self, frame: np.ndarray) -> list[Detection]:
-        """ByteTrack via Ultralytics — stable IDs across frames for crossing counts."""
+        """Tracked detection — stable IDs across frames for crossing counts.
+
+        Tracker is configurable (`TRACKER`, default botsort.yaml). BoT-SORT uses
+        appearance/ReID cues, so it keeps IDs stable across brief occlusion much
+        better than motion-only ByteTrack — which directly reduces the
+        same-person-counted-twice error at entrances.
+        """
         results = self._model.track(
             frame,
             conf=self._conf,
             persist=True,
             verbose=False,
-            tracker="bytetrack.yaml",
+            tracker=self._tracker,
         )
         return self._parse_results(results, tracked=True)
 

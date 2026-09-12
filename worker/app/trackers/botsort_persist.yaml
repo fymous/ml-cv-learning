@@ -1,0 +1,21 @@
+# Persistence-tuned BoT-SORT for busy, static CCTV doorways.
+# Goal: keep the SAME track_id through brief occlusion in a crowd so line
+# crossings are not missed (fewer ID switches = fewer dropped counts).
+
+tracker_type: botsort
+track_high_thresh: 0.25
+track_low_thresh: 0.1
+new_track_thresh: 0.5   # higher → fewer spurious short-lived tracks (less churn)
+track_buffer: 60        # keep lost tracks alive longer → re-attach same ID after occlusion
+match_thresh: 0.8
+fuse_score: True
+
+# Static camera: global motion compensation off (sparseOptFlow assumes a moving cam).
+gmc_method: none
+
+# ReID on (uses detector features, no extra model) → re-associate identities
+# through overlap instead of minting new IDs.
+proximity_thresh: 0.5
+appearance_thresh: 0.8
+with_reid: True
+model: auto

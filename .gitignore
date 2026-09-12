@@ -21,3 +21,7 @@ Thumbs.db
 *.log
 .insightface/
 yolov8*.pt
+yolo11*.pt
+
+# Local-only test UI (not pushed)
+/ui/

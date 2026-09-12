@@ -1,13 +1,34 @@
 # Polygons are normalized 0–1 (x, y). Draw them against your own sample video.
 zones:
+  # Entrance counting is most accurate with a directed tripwire `line` instead
+  # of a polygon: a person who steps in and straight back out never completes an
+  # inward crossing, so they are not double-counted.
+  #   line:         two points [ [ax,ay], [bx,by] ] the person walks across
+  #   in_direction: vector pointing INTO the venue (here [0,1] = downward in the
+  #                 frame). Omit it to treat the left of the a->b arrow as inside.
+  # A polygon is still allowed (legacy presence counting) if no line is given.
   - id: entrance-1
     type: entrance
     name: Door
+    line:
+      - [0.30, 0.75]
+      - [0.70, 0.75]
+    in_direction: [0.0, 1.0]
     polygon:
       - [0.30, 0.55]
       - [0.70, 0.55]
       - [0.70, 0.95]
       - [0.30, 0.95]
+  # Anyone whose feet enter a `staff` (or `exclude`) zone is tagged staff and
+  # is not counted as a visitor — e.g. the security guard's post by the door.
+  - id: staff-1
+    type: staff
+    name: Guard post
+    polygon:
+      - [0.72, 0.55]
+      - [0.98, 0.55]
+      - [0.98, 0.98]
+      - [0.72, 0.98]
   - id: queue-1
     type: queue
     name: Line

@@ -34,7 +34,11 @@ def main() -> None:
         zones = load_zones(args.zones)
         logger.info("loaded %d zones from %s", len(zones), args.zones)
 
-    spec = CameraSpec(camera_id=args.camera_id, source=args.source, zones=zones)
+    spec = CameraSpec(
+        camera_id=args.camera_id,
+        source=args.source,
+        zones=zones,
+    )
     CameraLoop(spec).run()
 
 

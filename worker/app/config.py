@@ -10,10 +10,18 @@ class WorkerSettings(BaseSettings):
         extra="ignore",
     )
 
-    inference_fps: float = 1.0
-    yolo_model: str = "yolov8n.pt"
+    inference_fps: float = 2.0
+    yolo_model: str = "yolo11n.pt"
     yolo_conf_threshold: float = 0.4
     pose_conf_threshold: float = 0.5
+
+    # Tracker config passed to Ultralytics .track(). botsort.yaml is ReID/appearance
+    # aware and keeps IDs stable across brief occlusion far better than bytetrack.yaml.
+    tracker: str = "botsort.yaml"
+
+    # InsightFace model pack for demographics. buffalo_l is more accurate than
+    # buffalo_s at a modest CPU cost; only runs when FEATURE_DEMOGRAPHICS is on.
+    demographics_model: str = "buffalo_l"
 
     # once = process a file to EOF then exit; live = reconnect / loop
     worker_mode: str = "once"
@@ -28,6 +36,15 @@ class WorkerSettings(BaseSettings):
     feature_demographics: bool = False
     feature_kit: bool = False
     feature_pose: bool = False
+    feature_group: bool = True
+
+    # Exclude guards / staff / passers-by from the people count. Uses `staff` or
+    # `exclude` zones, plus optional uniform-colour matching.
+    feature_staff_filter: bool = True
+    # Optional list of OpenCV HSV ranges [[h_lo,s_lo,v_lo,h_hi,s_hi,v_hi], ...]
+    # for staff uniforms. Empty = colour matching off (zones only). Set via env
+    # as JSON, e.g. STAFF_UNIFORM_HSV='[[90,60,40,130,255,255]]'.
+    staff_uniform_hsv: list[list[int]] = []
 
 
 @lru_cache
