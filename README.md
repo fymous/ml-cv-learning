@@ -57,6 +57,7 @@ FEATURE_POSE=false
 
 ## Docs
 
+- [FEATURES.md](FEATURES.md) — what to build, in order
 - [STRUCTURE.md](STRUCTURE.md) — folders, loop, YOLO, ByteTrack, pose, zones
 - [FEATURE_CONTRACT.md](FEATURE_CONTRACT.md) — how to add a capability so it can be copied elsewhere later
 - [PROMPT.md](PROMPT.md) — paste this into Cursor on another machine when you start a new feature
