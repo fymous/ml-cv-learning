@@ -1,0 +1,26 @@
+# Polygons are normalized 0–1 (x, y). Draw them against your own sample video.
+zones:
+  - id: entrance-1
+    type: entrance
+    name: Door
+    polygon:
+      - [0.30, 0.55]
+      - [0.70, 0.55]
+      - [0.70, 0.95]
+      - [0.30, 0.95]
+  - id: queue-1
+    type: queue
+    name: Line
+    polygon:
+      - [0.05, 0.35]
+      - [0.40, 0.35]
+      - [0.40, 0.90]
+      - [0.05, 0.90]
+  - id: kit-1
+    type: kit
+    name: Bench
+    polygon:
+      - [0.55, 0.20]
+      - [0.95, 0.20]
+      - [0.95, 0.70]
+      - [0.55, 0.70]
