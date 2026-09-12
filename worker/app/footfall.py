@@ -16,11 +16,15 @@ Both modes:
 - de-duplicate same-frame boxes with NMS,
 - guard against ByteTrack/BoT-SORT ID splits,
 - debounce so one track cannot re-count within a short cooldown,
-- require a minimum track age before the first count,
-- emit an approximate DwellEvent once a counted track disappears.
+- require a minimum track age before the first count.
 
 `CrossingEvent` keeps the exact fields demographics/group already consume;
 `direction` is now "enter" or "exit".
+
+Time-spent-in-a-zone (dwell / loitering) is intentionally NOT handled here —
+see `features/dwell_time.py`. That is a separate concern (e.g. "how long did
+this shopper browse the shelving zone") from entrance arrival/departure
+counting, uses its own zones, and should stay decoupled.
 """
 
 from __future__ import annotations
@@ -64,14 +68,6 @@ class CrossingEvent:
 
 
 @dataclass
-class DwellEvent:
-    zone_id: str
-    track_id: int
-    entered_seq: int
-    dwell_sec: float
-
-
-@dataclass
 class _TrackState:
     inside: bool
     missed: int = 0
@@ -83,9 +79,6 @@ class _TrackState:
     fx: float = 0.0  # last feet-point x
     fy: float = 0.0  # last feet-point y
     has_feet: bool = False
-    entered_seq: int | None = None
-    entered_at: float = 0.0
-    last_seen_at: float = 0.0
     last_count_at: float = -1e9
 
 
@@ -96,7 +89,6 @@ class ZoneFootfall:
     entered: int = 0
     exited: int = 0
     _tracks: dict[int, _TrackState] = field(default_factory=dict, repr=False)
-    _dwell_events: list[DwellEvent] = field(default_factory=list, repr=False)
 
     @property
     def net(self) -> int:
@@ -226,13 +218,12 @@ class EntranceCounter:
             if st is None:
                 zf._tracks[tid] = _TrackState(
                     inside=False, frames=1, x1=d.x1, y1=d.y1, x2=d.x2, y2=d.y2,
-                    fx=fx, fy=fy, has_feet=True, last_seen_at=media_ts,
+                    fx=fx, fy=fy, has_feet=True,
                 )
                 continue
             st.frames += 1
             st.missed = 0
             st.x1, st.y1, st.x2, st.y2 = d.x1, d.y1, d.x2, d.y2
-            st.last_seen_at = media_ts
 
             if (
                 tid not in exclude
@@ -244,8 +235,6 @@ class EntranceCounter:
                 inward = crossing_is_inward((st.fx, st.fy), (fx, fy), a, b, in_dir)
                 if inward:
                     zf.entered += 1
-                    st.entered_seq = zf.entered
-                    st.entered_at = media_ts
                     st.inside = True
                     events.append(self._event("enter", zf, tid, zf.entered, d))
                     logger.info(
@@ -297,8 +286,7 @@ class EntranceCounter:
                     zf.entered += 1
                     zf._tracks[tid] = _TrackState(
                         inside=True, frames=1, x1=d.x1, y1=d.y1, x2=d.x2, y2=d.y2,
-                        fx=fx, fy=fy, has_feet=True, entered_seq=zf.entered,
-                        entered_at=media_ts, last_seen_at=media_ts, last_count_at=media_ts,
+                        fx=fx, fy=fy, has_feet=True, last_count_at=media_ts,
                     )
                     events.append(self._event("enter", zf, tid, zf.entered, d))
                     logger.info(
@@ -308,14 +296,13 @@ class EntranceCounter:
                 else:
                     zf._tracks[tid] = _TrackState(
                         inside=inside, frames=1, x1=d.x1, y1=d.y1, x2=d.x2, y2=d.y2,
-                        fx=fx, fy=fy, has_feet=True, last_seen_at=media_ts,
+                        fx=fx, fy=fy, has_feet=True,
                     )
                 continue
             prev = state.inside
             state.frames += 1
             state.missed = 0
             state.x1, state.y1, state.x2, state.y2 = d.x1, d.y1, d.x2, d.y2
-            state.last_seen_at = media_ts
             if (
                 not prev
                 and inside
@@ -324,8 +311,6 @@ class EntranceCounter:
                 and not _is_id_split(zf._tracks, tid, d.x1, d.y1, d.x2, d.y2)
             ):
                 zf.entered += 1
-                state.entered_seq = zf.entered
-                state.entered_at = media_ts
                 state.last_count_at = media_ts
                 events.append(self._event("enter", zf, tid, zf.entered, d))
                 logger.info(
@@ -360,41 +345,7 @@ class EntranceCounter:
             st = zf._tracks[tid]
             st.missed += 1
             if st.missed > _MISS_GRACE_FRAMES:
-                if st.entered_seq is not None:
-                    zf._dwell_events.append(
-                        DwellEvent(
-                            zone_id=zf.zone_id,
-                            track_id=tid,
-                            entered_seq=st.entered_seq,
-                            dwell_sec=max(0.0, st.last_seen_at - st.entered_at),
-                        )
-                    )
                 del zf._tracks[tid]
 
     def summary(self) -> list[dict]:
         return [z.as_dict() for z in self._zones]
-
-    def pop_dwell_events(self) -> list[DwellEvent]:
-        events: list[DwellEvent] = []
-        for zf in self._zones:
-            if zf._dwell_events:
-                events.extend(zf._dwell_events)
-                zf._dwell_events = []
-        return events
-
-    def finalize(self) -> list[DwellEvent]:
-        events: list[DwellEvent] = []
-        for zf in self._zones:
-            for tid, st in list(zf._tracks.items()):
-                if st.entered_seq is not None:
-                    events.append(
-                        DwellEvent(
-                            zone_id=zf.zone_id,
-                            track_id=tid,
-                            entered_seq=st.entered_seq,
-                            dwell_sec=max(0.0, st.last_seen_at - st.entered_at),
-                        )
-                    )
-            zf._tracks.clear()
-        events.extend(self.pop_dwell_events())
-        return events

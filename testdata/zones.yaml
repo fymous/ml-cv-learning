@@ -45,3 +45,14 @@ zones:
       - [0.95, 0.20]
       - [0.95, 0.70]
       - [0.55, 0.70]
+  # `dwell` zones measure time-in-zone per visitor (features/dwell_time.py) —
+  # completely separate from entrance counting above. Draw one per aisle/
+  # section you want a "how long did they browse here" metric for.
+  - id: dwell-1
+    type: dwell
+    name: Produce aisle
+    polygon:
+      - [0.05, 0.10]
+      - [0.45, 0.10]
+      - [0.45, 0.50]
+      - [0.05, 0.50]

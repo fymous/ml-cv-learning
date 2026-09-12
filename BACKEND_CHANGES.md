@@ -7,7 +7,7 @@ gitignored test harness, not part of the shipped backend.
 
 ## Why
 
-The existing worker had three concrete accuracy bugs, plus two missing
+The existing worker had three concrete accuracy bugs, plus three missing
 capabilities:
 
 1. **Double counting** — the entrance was a polygon; anyone who stepped in and
@@ -19,8 +19,11 @@ capabilities:
 4. **No group-vs-individual distinction** — a family of 3 counted as 3 separate
    visits.
 5. **No way to exclude staff/guards/passers-by** from the visitor count.
+6. **No browsing/time-in-zone signal** — no way to answer "how long did this
+   shopper spend at the shelf/counter," a distinct retail KPI from entrance
+   arrivals.
 
-Everything below addresses one of these five.
+Everything below addresses one of these six.
 
 ---
 
@@ -123,6 +126,15 @@ New geometry primitives backing this live in `worker/app/zones.py`:
 `line_to_frame_space`, `_orient` (signed triangle area, for orientation
 tests), `segments_intersect` (proper segment-intersection test),
 `crossing_is_inward` (direction resolution).
+
+**Dwell/loitering time was intentionally removed from this file.** An earlier
+iteration tracked "how long since this track was counted as entered" directly
+inside `EntranceCounter` (a `DwellEvent`, `pop_dwell_events()`, `finalize()`).
+That was deleted — "time spent near the entrance tripwire" isn't a meaningful
+retail metric, and it doesn't belong bolted onto arrival/departure counting.
+See §6 for where dwell now actually lives. Diffing confirms this removal
+changed **zero** counting logic — only dead bookkeeping fields
+(`entered_at`, `last_seen_at`, `entered_seq`) were dropped.
 
 ---
 
@@ -290,7 +302,90 @@ compatibility but is no longer the code path `camera_loop.py` uses.
 
 ---
 
-## 6. Zone model & config plumbing
+## 6. Dwell time — new, deliberately standalone feature (`features/dwell_time.py`)
+
+Retail question this answers: **"how long did this shopper spend browsing
+the produce aisle / standing at the counter,"** measured over its own
+`dwell`-type zone — completely independent of whether footfall/entrance
+counting is even enabled. This is a genuinely separate concept from §2's
+entrance dwell removal: it needs its own area zone (drawn wherever you want
+"time spent" measured), not the entrance line.
+
+**Mechanics**, per zone, per track:
+
+- a person's feet-point inside the polygon starts (or continues) a per-track
+  timer,
+- brief tracker misses or a momentary step outside the polygon don't reset
+  the timer — `_MISS_GRACE_FRAMES = 15` frames of tolerance, the same idea as
+  footfall's occlusion grace,
+- once gone longer than that grace period, the stay is finalized into a
+  `DwellEvent(zone_id, zone_name, track_id, entered_at, left_at)`,
+- `finalize(media_ts)` flushes anyone still inside when the run/stream ends,
+  so a visitor still browsing at the last frame isn't silently dropped.
+
+**Minimum-stay gate — only sustained dwelling is "highlighted":**
+
+```177:186:worker/app/features/dwell_time.py
+    def _finalize_one(self, zd: _ZoneDwell, tid: int, st: _TrackDwell) -> DwellEvent | None:
+        del zd._tracks[tid]
+        dwell_sec = max(0.0, st.last_seen_at - st.entered_at)
+        if dwell_sec < self._min_dwell_sec:
+            logger.debug(
+                "dwell IGNORED (too short) zone=%s track=%s dwell=%.1fs < min=%.1fs",
+                zd.zone_id, tid, dwell_sec, self._min_dwell_sec,
+            )
+            return None
+```
+
+`min_dwell_sec` defaults to **4.0 seconds** (config `dwell_min_sec` /
+env `DWELL_MIN_SEC`) — a stay shorter than that is dropped entirely: no
+event, no screenshot, not counted in any summary. Only a genuine ≥4s stay
+counts as "dwelling"; a brief walk-through of the zone is noise, not a visit.
+
+**Retail-meaningful bucketing** (`DWELL_BUCKETS`) turns raw seconds into an
+engagement signal, not just a number:
+
+```61:68:worker/app/features/dwell_time.py
+DWELL_BUCKETS: list[tuple[float, float, str]] = [
+    (0, 5, "<5s (passed by)"),
+    (5, 20, "5-20s (glanced)"),
+    (20, 60, "20-60s (looked)"),
+    (60, 180, "1-3min (browsed)"),
+    (180, 600, "3-10min (engaged)"),
+    (600, float("inf"), "10min+ (extended)"),
+]
+```
+
+No extra model, no per-frame inference cost — pure geometry + bookkeeping on
+detections the pipeline already produces. Accepts `exclude_ids` (staff tagged
+by §4) so a staff member restocking a shelf is never counted as a browsing
+customer.
+
+`DwellTracker.summary()` reports, per zone: `visits`, `currently_inside`,
+`avg_dwell_sec`, `median_dwell_sec`, `max_dwell_sec`, and the bucket
+histogram.
+
+**Config/wiring:**
+
+- `feature_dwell: bool = True` (`FEATURE_DWELL` env) — default on, but a
+  complete no-op if no `dwell`-type zone exists in `zones.yaml`.
+- `dwell_min_sec: float = 4.0` (`DWELL_MIN_SEC` env).
+- `camera_loop.py`: `self._dwell = DwellTracker(spec.zones,
+  min_dwell_sec=settings.dwell_min_sec)`, updated every frame right after
+  staff-tagging (so `exclude_ids` is available), finalized + logged in the
+  shutdown `finally` block alongside group/staff/demographics.
+- `self._use_tracking` was widened again — tracking now also turns on when a
+  dwell zone is enabled, independent of the footfall-gated condition used by
+  group/demographics (dwell has its own zones and doesn't need an `entrance`
+  zone to exist at all).
+- The event_sink protocol gained an **optional** `on_dwell(frame, detections,
+  exclude_ids, dwell_event, media_ts)` hook, checked with `hasattr()` before
+  calling — so it stays fully backward compatible with sinks that predate
+  dwell and never implement it.
+
+---
+
+## 7. Zone model & config plumbing
 
 `worker/app/models.py` — `ZoneConfig` gained two optional fields for the
 line-crossing entrance mode, and `polygon` became optional (a `line`-only
@@ -319,9 +414,12 @@ default `[]`).
 `testdata/zones.yaml` updated to demonstrate the new line-based entrance +
 a `staff` exclusion zone, with inline comments explaining the format.
 
+Zone type `dwell` (§6) needs no model changes — it's a plain polygon area
+zone like `staff`/`queue`/`kit`, just consumed by a different feature.
+
 ---
 
-## 7. `camera_loop.py` — orchestration changes
+## 8. `camera_loop.py` — orchestration changes
 
 Per-frame order of operations changed to support the new features, all still
 individually flag-gated:
@@ -341,9 +439,13 @@ individually flag-gated:
    screenshots — kept generic so the worker package never imports UI code)
    is invoked per crossing event, wrapped in try/except so a sink bug can
    never take down the detection loop.
+7. **Dwell update** (§6) — independent of the footfall/group/demographics
+   chain above, runs off its own zones right after staff-tagging; any
+   finalized dwell events are likewise offered to the event sink via the
+   optional `on_dwell(...)` hook, same try/except protection.
 
-On shutdown (`finally` in `run()`), it now logs group, staff, and
-demographics summaries in addition to the footfall summary that was already
+On shutdown (`finally` in `run()`), it now logs group, staff, demographics,
+and dwell summaries in addition to the footfall summary that was already
 there.
 
 **Note on a reverted change:** an annotated-debug-video renderer
@@ -356,31 +458,32 @@ surprise if you see it referenced elsewhere.
 
 ---
 
-## 8. Dependencies & environment
+## 9. Dependencies & environment
 
 | File | Change |
 |---|---|
 | `worker/requirements.txt` | `+ lap>=0.5.12` (BoT-SORT tracker association) |
-| `.env.example` | `INFERENCE_FPS` 1.0→2.0, `YOLO_MODEL` yolov8n→yolo11n; added `TRACKER`, `DEMOGRAPHICS_MODEL`, `FEATURE_GROUP=true`, `FEATURE_STAFF_FILTER=true`, `STAFF_UNIFORM_HSV=[]` |
+| `.env.example` | `INFERENCE_FPS` 1.0→2.0, `YOLO_MODEL` yolov8n→yolo11n; added `TRACKER`, `DEMOGRAPHICS_MODEL`, `FEATURE_GROUP=true`, `FEATURE_STAFF_FILTER=true`, `STAFF_UNIFORM_HSV=[]`, `FEATURE_DWELL=true`, `DWELL_MIN_SEC=4.0` |
 | `.gitignore` | `+ yolo11*.pt` (new model weights shouldn't be committed); `+ /ui/` (local test harness excluded from the repo) |
 
 ---
 
-## 9. File-by-file summary
+## 10. File-by-file summary
 
 | File | Status | What changed |
 |---|---|---|
-| `worker/app/config.py` | modified | New settings: `tracker`, `demographics_model`, `feature_group`, `feature_staff_filter`, `staff_uniform_hsv`; defaults bumped (`inference_fps`, `yolo_model`) |
+| `worker/app/config.py` | modified | New settings: `tracker`, `demographics_model`, `feature_group`, `feature_staff_filter`, `staff_uniform_hsv`, `feature_dwell`, `dwell_min_sec`; defaults bumped (`inference_fps`, `yolo_model`) |
 | `worker/app/models.py` | modified | `ZoneConfig.line`, `ZoneConfig.in_direction`, `polygon` now optional |
 | `worker/app/zone_loader.py` | modified | Parses `line`/`in_direction` |
 | `worker/app/zones.py` | modified | Added `line_to_frame_space`, `_orient`, `segments_intersect`, `crossing_is_inward` |
-| `worker/app/footfall.py` | rewritten | Directional line-crossing entrance mode + polygon fallback; enter/exit/net; exclude_ids support |
+| `worker/app/footfall.py` | rewritten | Directional line-crossing entrance mode + polygon fallback; enter/exit/net; exclude_ids support; all dwell bookkeeping removed (moved to `features/dwell_time.py`) |
 | `worker/app/inference/yolo_backend.py` | modified | Tracker is configurable, not hardcoded to `bytetrack.yaml` |
 | `worker/app/features/demographics.py` | rewritten | Multi-frame voting (`DemographicsAggregator`), run-level tally (`DemographicsTally`), age buckets, quality gate, configurable model pack |
 | `worker/app/features/group_count.py` | new | Co-arrival group clustering off enter events |
 | `worker/app/features/staff_filter.py` | new | Zone- and (optional) uniform-colour-based staff/passer-by exclusion |
+| `worker/app/features/dwell_time.py` | new | Standalone time-in-zone/browsing dwell, own `dwell` zone type, 4s minimum-stay gate, retail bucket histogram |
 | `worker/app/trackers/botsort_persist.yaml` | new | Persistence-tuned BoT-SORT profile for busy static doorways |
-| `worker/app/camera_loop.py` | modified | Wires all of the above together; widened tracking condition; event_sink hook; shutdown summaries |
+| `worker/app/camera_loop.py` | modified | Wires all of the above together; widened tracking condition (now incl. dwell); event_sink hook gained optional `on_dwell`; shutdown summaries incl. dwell |
 | `worker/app/main.py` | modified | Minor cleanup (removed a since-reverted debug-video CLI flag) |
 | `worker/requirements.txt` | modified | `+ lap` |
 | `.env.example`, `.gitignore` | modified | New flags/defaults; ignore new model weights and the local UI folder |
@@ -388,7 +491,7 @@ surprise if you see it referenced elsewhere.
 
 ---
 
-## 10. What this does **not** change
+## 11. What this does **not** change
 
 - No new outbound network calls / cloud dependency — InsightFace weights
   download once (from InsightFace's model zoo) and are cached locally; all

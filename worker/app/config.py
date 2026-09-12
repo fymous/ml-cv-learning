@@ -46,6 +46,15 @@ class WorkerSettings(BaseSettings):
     # as JSON, e.g. STAFF_UNIFORM_HSV='[[90,60,40,130,255,255]]'.
     staff_uniform_hsv: list[list[int]] = []
 
+    # Time-in-zone / browsing dwell (features/dwell_time.py). Independent of
+    # entrance footfall — measures time spent in `dwell`-type zones (e.g. a
+    # product aisle). Safe no-op if no such zone is drawn.
+    feature_dwell: bool = True
+    # Minimum seconds someone must stay in a dwell zone before it's flagged as
+    # a dwell at all (highlighted + counted). Shorter stays are ignored —
+    # a brief walk-through is not "dwelling".
+    dwell_min_sec: float = 4.0
+
 
 @lru_cache
 def get_settings() -> WorkerSettings:

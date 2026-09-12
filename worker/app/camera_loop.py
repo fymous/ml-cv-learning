@@ -4,7 +4,8 @@ Per frame:
   1. Pull frame
   2. YOLO detect / ByteTrack
   3. Optional pose on each person crop
-  4. Feature hooks (footfall, queue, demographics, kit) — each flagged
+  4. Feature hooks (footfall, group, staff filter, demographics, dwell,
+     queue, kit) — each independently flagged
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from app.config import get_settings
+from app.features.dwell_time import DwellTracker
 from app.features.group_count import GroupCounter
 from app.features.queue_length import QueueMonitor
 from app.features.staff_filter import StaffFilter
@@ -37,7 +39,10 @@ class CameraSpec:
     # per-event screenshots. Must expose:
     #   on_crossing(frame, detections, exclude_ids, ev, demo, group_result,
     #               footfall_summary, media_ts)
-    # Kept generic so the worker never imports UI code.
+    # May optionally also expose:
+    #   on_dwell(frame, detections, exclude_ids, dwell_event, media_ts)
+    # (checked with hasattr — older sinks without it simply don't get dwell
+    # callbacks). Kept generic so the worker never imports UI code.
     event_sink: object | None = None
 
 
@@ -73,13 +78,25 @@ class CameraLoop:
 
             self._demog = DemographicsAggregator()
             self._demog_tally = DemographicsTally()
-        # Tracking is needed by footfall, group, and demographics (all key off
-        # stable track IDs), and only makes sense with an entrance zone present.
-        self._use_tracking = self._footfall.enabled and (
-            settings.feature_footfall
-            or settings.feature_group
-            or settings.feature_demographics
+        # Time-in-zone browsing dwell — independent of footfall, keys off its
+        # own `dwell`-type zones. No-op if none are drawn.
+        self._dwell = (
+            DwellTracker(spec.zones, min_dwell_sec=settings.dwell_min_sec)
+            if settings.feature_dwell
+            else None
         )
+        self._last_media_ts = 0.0
+        # Tracking is needed by footfall, group, and demographics (all key off
+        # stable track IDs and only make sense with an entrance zone present),
+        # or independently by dwell (keys off its own dwell zones).
+        self._use_tracking = (
+            self._footfall.enabled
+            and (
+                settings.feature_footfall
+                or settings.feature_group
+                or settings.feature_demographics
+            )
+        ) or (self._dwell is not None and self._dwell.enabled)
         self._queue = QueueMonitor(spec.zones)
         self._frames = 0
         self._started_at = 0.0
@@ -121,10 +138,14 @@ class CameraLoop:
                 logger.info("staff summary %s", self._staff.summary())
             if self._demog_tally is not None:
                 logger.info("demographics summary %s", self._demog_tally.summary())
+            if self._dwell is not None and self._dwell.enabled:
+                self._dwell.finalize(self._last_media_ts)
+                logger.info("dwell summary %s", self._dwell.summary())
 
     def _process_frame(self, frame: np.ndarray, wall_ts: float, media_ts: float) -> None:
         settings = get_settings()
         h, w = frame.shape[:2]
+        self._last_media_ts = media_ts
 
         if self._use_tracking:
             detections = self._yolo.detect_tracked(frame)
@@ -152,6 +173,18 @@ class CameraLoop:
         exclude_ids: set[int] = set()
         if self._staff is not None and self._staff.enabled:
             exclude_ids = self._staff.mark(detections, w, h, frame)
+
+        # Browsing dwell time — its own zones, staff excluded (restocking a
+        # shelf isn't a customer visit).
+        if self._dwell is not None and self._dwell.enabled:
+            dwell_events = self._dwell.update(detections, w, h, media_ts, exclude_ids)
+            sink = self.spec.event_sink
+            if dwell_events and sink is not None and hasattr(sink, "on_dwell"):
+                for dev in dwell_events:
+                    try:
+                        sink.on_dwell(frame, detections, exclude_ids, dev, media_ts)
+                    except Exception:  # noqa: BLE001 — a capture bug must not kill the run
+                        logger.exception("event_sink.on_dwell failed")
 
         # Demographics: accumulate per-track face votes across frames (only the
         # gated, good-quality faces are kept). Resolved once, on the enter event.
