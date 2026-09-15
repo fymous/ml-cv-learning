@@ -45,6 +45,11 @@ class WorkerSettings(BaseSettings):
     # for staff uniforms. Empty = colour matching off (zones only). Set via env
     # as JSON, e.g. STAFF_UNIFORM_HSV='[[90,60,40,130,255,255]]'.
     staff_uniform_hsv: list[list[int]] = []
+    # Path to a learned staff profile (staff_profile.json from onboarding —
+    # staff standing in an `enroll` zone). When present, its uniform HSV ranges
+    # are merged into the staff filter, so staff are recognised by uniform
+    # anywhere in frame. See features/staff_identity.py.
+    staff_profile_path: str = ""
 
     # Time-in-zone / browsing dwell (features/dwell_time.py). Independent of
     # entrance footfall — measures time spent in `dwell`-type zones (e.g. a
@@ -54,6 +59,20 @@ class WorkerSettings(BaseSettings):
     # a dwell at all (highlighted + counted). Shorter stays are ignored —
     # a brief walk-through is not "dwelling".
     dwell_min_sec: float = 4.0
+
+    # Customer attendance / unattended-customer alerting (features/attendance.py).
+    # Runs inside `service`-type zones; needs the staff filter on to know who
+    # is staff. Safe no-op if no `service` zone is drawn.
+    feature_attendance: bool = True
+    # A staff member within this many metres (bbox-height-normalised) of a
+    # customer counts as being close enough to attend them.
+    attend_proximity_m: float = 1.5
+    # Cumulative seconds a staff member must spend close before the customer is
+    # latched as "attended" (a staff merely walking past shouldn't count).
+    attend_min_sec: float = 2.0
+    # A customer present in the service zone this long with no staff attending
+    # raises one "unattended" alert (per party).
+    unattended_alert_sec: float = 5.0
 
 
 @lru_cache

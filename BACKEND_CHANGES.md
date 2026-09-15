@@ -2,8 +2,10 @@
 
 This documents everything changed in `worker/` (plus root config files it
 depends on: `.env.example`, `.gitignore`, `testdata/zones.yaml`) during this
-round of work. **UI (`ui/`) is intentionally excluded** — it's a local,
-gitignored test harness, not part of the shipped backend.
+round of work. **UI changes are not detailed here** — `ui/` is a local
+Streamlit test harness for exercising these backend features; its source is
+now pushed alongside the backend (generated run output under `ui/outputs/`
+stays gitignored), but this doc's scope stays backend/`worker/` only.
 
 ## Why
 
@@ -415,7 +417,11 @@ default `[]`).
 a `staff` exclusion zone, with inline comments explaining the format.
 
 Zone type `dwell` (§6) needs no model changes — it's a plain polygon area
-zone like `staff`/`queue`/`kit`, just consumed by a different feature.
+zone like `staff`/`queue`/`kit`, just consumed by a different feature. The
+same is true for the two zone types added in §12/§13: `service` (attendance)
+and `enroll` (staff-uniform onboarding) — no `ZoneConfig`/loader changes were
+needed for either, since `zone_type` is a free-form string and every feature
+just filters `zones` by the value it cares about.
 
 ---
 
@@ -463,8 +469,8 @@ surprise if you see it referenced elsewhere.
 | File | Change |
 |---|---|
 | `worker/requirements.txt` | `+ lap>=0.5.12` (BoT-SORT tracker association) |
-| `.env.example` | `INFERENCE_FPS` 1.0→2.0, `YOLO_MODEL` yolov8n→yolo11n; added `TRACKER`, `DEMOGRAPHICS_MODEL`, `FEATURE_GROUP=true`, `FEATURE_STAFF_FILTER=true`, `STAFF_UNIFORM_HSV=[]`, `FEATURE_DWELL=true`, `DWELL_MIN_SEC=4.0` |
-| `.gitignore` | `+ yolo11*.pt` (new model weights shouldn't be committed); `+ /ui/` (local test harness excluded from the repo) |
+| `.env.example` | `INFERENCE_FPS` 1.0→2.0, `YOLO_MODEL` yolov8n→yolo11n; added `TRACKER`, `DEMOGRAPHICS_MODEL`, `FEATURE_GROUP=true`, `FEATURE_STAFF_FILTER=true`, `STAFF_UNIFORM_HSV=[]`, `FEATURE_DWELL=true`, `DWELL_MIN_SEC=4.0`, `FEATURE_ATTENDANCE=true`, `ATTEND_PROXIMITY_M=1.5`, `ATTEND_MIN_SEC=2.0`, `UNATTENDED_ALERT_SEC=5.0`, `STAFF_PROFILE_PATH=` |
+| `.gitignore` | `+ yolo11*.pt` (new model weights shouldn't be committed). The earlier `/ui/` blanket-exclude was removed — `ui/`'s source is now pushed (see doc header); its own `ui/.gitignore` still keeps `outputs/` and `__pycache__/` out |
 
 ---
 
@@ -482,12 +488,15 @@ surprise if you see it referenced elsewhere.
 | `worker/app/features/group_count.py` | new | Co-arrival group clustering off enter events |
 | `worker/app/features/staff_filter.py` | new | Zone- and (optional) uniform-colour-based staff/passer-by exclusion |
 | `worker/app/features/dwell_time.py` | new | Standalone time-in-zone/browsing dwell, own `dwell` zone type, 4s minimum-stay gate, retail bucket histogram |
+| `worker/app/features/attendance.py` | new | §12 — customer attendance / unattended alerting, own `service` zone type, party-aware state machine |
+| `worker/app/features/staff_identity.py` | new | §13 — learned staff-uniform profile (`StaffProfile`/`UniformLearner`), own `enroll` zone type (onboarding only) |
 | `worker/app/trackers/botsort_persist.yaml` | new | Persistence-tuned BoT-SORT profile for busy static doorways |
-| `worker/app/camera_loop.py` | modified | Wires all of the above together; widened tracking condition (now incl. dwell); event_sink hook gained optional `on_dwell`; shutdown summaries incl. dwell |
+| `worker/app/camera_loop.py` | modified | Wires all of the above together; widened tracking condition (now incl. dwell + attendance); event_sink hook gained optional `on_dwell`/`on_attendance`; shutdown summaries incl. dwell + attendance; `_staff_uniform_ranges()` merges hand-set + learned uniform HSV ranges |
+| `worker/app/config.py` | modified | New settings: `feature_attendance`, `attend_proximity_m`, `attend_min_sec`, `unattended_alert_sec`, `staff_profile_path` |
 | `worker/app/main.py` | modified | Minor cleanup (removed a since-reverted debug-video CLI flag) |
 | `worker/requirements.txt` | modified | `+ lap` |
-| `.env.example`, `.gitignore` | modified | New flags/defaults; ignore new model weights and the local UI folder |
-| `testdata/zones.yaml` | modified | Example line-based entrance + staff zone, with explanatory comments |
+| `.env.example`, `.gitignore` | modified | New flags/defaults; ignore new model weights; `ui/` no longer blanket-ignored |
+| `testdata/zones.yaml` | modified | Example line-based entrance + staff zone; added example `service` and `enroll` zones, with explanatory comments |
 
 ---
 
@@ -500,3 +509,144 @@ surprise if you see it referenced elsewhere.
   are untouched — queue and kit zone types still exist in the data model and
   loader, just not exercised by any of the changes above.
 - No change to `worker/app/rtsp/puller.py` (frame source / reconnect logic).
+
+---
+
+## 12. Customer attendance / unattended-customer alerting — new feature (`features/attendance.py`)
+
+Retail question this answers: **"is a customer being helped, and if not, for
+how long have they been waiting?"** Runs over a new `service`-type zone
+(the sales counter / area a staff member should attend), independent of
+footfall/dwell.
+
+**Why it's anchored on staff identification, not generic proximity:** a
+customer's friend standing next to them must never be mistaken for staff.
+`AttendanceMonitor` only starts an "attended" timer when a track already
+tagged staff by `StaffFilter` (§4/§13) is close by — a friend is a customer,
+never staff-tagged, so this can't happen by construction.
+
+**State machine per customer track**, scoped to the `service` zone:
+
+- feet inside the zone + a staff track within `attend_proximity_m` (default
+  1.5m, bbox-height-normalised so it's roughly metric regardless of camera
+  distance) accumulates an attention timer;
+- ≥ `attend_min_sec` (default 2.0s) of accumulated staff proximity **latches**
+  the customer as `attended` — permanently for that track, even if the staff
+  leaves and the customer keeps browsing alone afterward;
+- no staff within reach for `unattended_alert_sec` (default 5.0s) raises one
+  `AttendanceEvent(kind="unattended", ...)`, suppressed if attended or if
+  staff is currently approaching.
+
+**Groups are handled at the party level**, not per person — solving "don't
+mistake a customer's friend for a helper, and don't alert once per friend":
+
+```221:230:worker/app/features/attendance.py
+        # 2) parties via current-proximity components.
+        comps = self._components(now)
+
+        # 3) propagate attended across a party (staff helped one → all helped).
+        for comp in comps:
+            if any(self._cust[t].attended for t in comp):
+                for t in comp:
+                    if not self._cust[t].attended:
+                        self._cust[t].attended = True
+                        self._by_id[self._cust[t].zone_id].attended.add(t)
+```
+
+Parties are recomputed each frame by standing-proximity (`_PARTY_RADIUS_M =
+1.2`, same bbox-height-normalised metric distance as staff proximity) via a
+small union-find over currently-visible customers — no persistent per-party
+object, state (`attended`/`alerted`) lives per track and is OR'd across the
+current component. Consequence: if staff attends any one member of a group,
+the whole group is latched attended, and exactly one unattended alert fires
+per group, not one per friend.
+
+`AttendanceMonitor.summary()` reports, per `service` zone: `customers_seen`,
+`attended`, `unattended_alerts`, `currently_waiting`.
+
+**Config:** `feature_attendance: bool = True` (`FEATURE_ATTENDANCE`, no-op
+without a `service` zone), `attend_proximity_m: float = 1.5`
+(`ATTEND_PROXIMITY_M`), `attend_min_sec: float = 2.0` (`ATTEND_MIN_SEC`),
+`unattended_alert_sec: float = 5.0` (`UNATTENDED_ALERT_SEC`).
+
+**Known limitation:** the attended-latch is keyed to `track_id`. A customer
+who leaves frame and re-enters (or whose ID switches on the tracker) is
+treated as a new customer — fixable later with the ReID work in §13.
+
+---
+
+## 13. Staff identity — learned uniform onboarding (`features/staff_identity.py`)
+
+Problem this solves: a `staff` zone drawn over the payment counter only
+tags cashiers — floor/sales staff who roam the store to help customers (the
+people §12's attendance feature actually needs to recognise) may never step
+into it. The fix is to identify staff by **uniform colour**, learned from a
+short onboarding capture rather than hand-tuned per store.
+
+**Onboarding (UI-driven, backend-agnostic artifact):** staff stand in a new
+`enroll`-type zone for ~10–15s; for every person sampled there, `UniformLearner`
+takes the median HSV colour of a central torso ROI and accumulates it. Building
+the profile turns those raw samples into one or two robust HSV ranges:
+
+```221:236:worker/app/features/staff_identity.py
+    def build(self) -> StaffProfile:
+        ranges: list[list[int]] = []
+        if self._samples:
+            hsv = np.array(self._samples)
+            hue = hsv[:, 0]
+            # Red wraps the hue circle: samples cluster near 0 AND near 180.
+            wrap = bool((hue < 15).any() and (hue > 165).any())
+            if wrap:
+                low = hsv[hue < 90]
+                high = hsv[hue >= 90]
+                if len(low):
+                    ranges.append(self._envelope(low))
+                if len(high):
+                    ranges.append(self._envelope(high))
+            else:
+                ranges.append(self._envelope(hsv))
+```
+
+Ranges are built from the 5th–95th percentile of samples (padded), which
+absorbs real lighting variation while rejecting outliers; red uniforms wrap
+the hue circle (values cluster near both 0 and 180) and are split into two
+ranges automatically rather than producing one huge, useless range.
+
+**Reliability guard** — colour-only learning is only as good as its samples.
+If the enroll zone caught people in inconsistent clothing (no real uniform,
+or a customer wandered through), the percentile envelope balloons.
+`profile_coverage()` measures what fraction of HSV colour space a learned
+profile covers; `uniform_spread_warning()` returns a human-readable warning
+above a threshold (default 12%) so an unreliable profile is flagged instead
+of silently over-tagging customers as staff.
+
+**Persistence & wiring:** the learned ranges are saved to a `StaffProfile`
+JSON artifact (`staff_profile.json` — uniform ranges + sample/track counts +
+timestamp). `CameraLoop` loads it via a new `staff_profile_path` setting and
+merges its ranges into whatever `staff_uniform_hsv` is already configured,
+so it's additive with hand-set ranges:
+
+```120:128:worker/app/camera_loop.py
+    @staticmethod
+    def _staff_uniform_ranges(settings) -> list[list[int]]:
+        """Uniform HSV ranges for the staff filter: hand-configured ranges plus
+        any learned during onboarding (staff_profile.json)."""
+        ranges = [list(r) for r in settings.staff_uniform_hsv]
+        if settings.staff_profile_path:
+            profile = StaffProfile.load(settings.staff_profile_path)
+            if profile and profile.enabled:
+                ranges.extend(profile.uniform_hsv)
+```
+
+No change to `StaffFilter` itself (§4) — it already consumed a list of HSV
+ranges; this just gives `camera_loop` a second source for that list.
+
+**Config:** `staff_profile_path: str = ""` (`STAFF_PROFILE_PATH` env) — empty
+means no profile, zero behavior change from §4.
+
+**Deliberately class-level, not per-person:** the profile models "what the
+uniform looks like", not individual staff identities, so new hires wearing
+the uniform are recognised automatically with no re-enrollment. Per-person
+identification (and robustness against look-alike customers / lighting / ID
+loss) is the next step — appearance ReID embeddings on the same `enroll`
+gesture — not yet implemented.

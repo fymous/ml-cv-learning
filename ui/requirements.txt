@@ -1,0 +1,4 @@
+# Local test UI (not pushed). Install into the worker venv so it can import `app`.
+# Note: we intentionally avoid streamlit-drawable-canvas (incompatible with the
+# newest streamlit component API). Zones are built with sliders + live preview.
+streamlit>=1.38.0
